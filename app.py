@@ -9,7 +9,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__, static_folder='static')
-ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'ADMIN123')
+ADMIN_SECRET = os.getenv('ADMIN_SECRET')
+if not ADMIN_SECRET:
+    raise ValueError('ADMIN_SECRET not set')
 DATABASE = 'database.db'
 
 # ─── Database ───────────────────────────────────────────────────────────────

@@ -67,7 +67,8 @@ def main():
     app.add_error_handler(on_error)
 
     logger.info('Bot is running in %s mode. Web app URL: %s', APP_ENV, WEBAPP_URL)
-    app.run_polling()
+    # Keep retrying on transient Telegram/network issues instead of exiting.
+    app.run_polling(bootstrap_retries=-1)
 
 if __name__ == '__main__':
     main()

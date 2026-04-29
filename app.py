@@ -2,6 +2,7 @@ import os
 import json
 import sqlite3
 import logging
+import hmac
 from contextlib import contextmanager
 from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory, g
@@ -19,6 +20,14 @@ logger = logging.getLogger(__name__)
 ADMIN_SECRET = os.getenv('ADMIN_SECRET')
 if not ADMIN_SECRET:
     raise ValueError('ADMIN_SECRET not set')
+WEBAPP_URL = os.getenv('WEBAPP_URL', '').strip()
+allowed_origins_env = os.getenv('CORS_ALLOWED_ORIGINS', '').strip()
+if allowed_origins_env:
+    CORS_ALLOWED_ORIGINS = [o.strip() for o in allowed_origins_env.split(',') if o.strip()]
+elif WEBAPP_URL:
+    CORS_ALLOWED_ORIGINS = [WEBAPP_URL]
+else:
+    CORS_ALLOWED_ORIGINS = ['*']
 RAILWAY_VOLUME_PATH = os.getenv('RAILWAY_VOLUME_MOUNT_PATH')
 default_db_path = os.path.join(RAILWAY_VOLUME_PATH, 'database.db') if RAILWAY_VOLUME_PATH else os.path.join(os.getcwd(), 'database.db')
 DATABASE = os.getenv('DATABASE_PATH', default_db_path)
@@ -181,6 +190,23 @@ def validate_questions(questions):
         })
     return validated, None
 
+def _is_allowed_origin(origin):
+    if not origin:
+        return False
+    if '*' in CORS_ALLOWED_ORIGINS:
+        return True
+    return origin in CORS_ALLOWED_ORIGINS
+
+def _apply_cors_headers(response):
+    origin = request.headers.get('Origin')
+    if _is_allowed_origin(origin):
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Vary'] = 'Origin'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Admin-Code'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+        response.headers['Access-Control-Max-Age'] = '86400'
+    return response
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.route('/')
@@ -195,12 +221,17 @@ def static_files(path):
 def health():
     return jsonify({'status': 'ok', 'service': 'telegram-test-miniapp', 'database': DATABASE})
 
+@app.before_request
+def handle_preflight():
+    if request.method == 'OPTIONS' and request.path.startswith('/api/'):
+        return _apply_cors_headers(app.make_response(('', 204)))
+
 @app.route('/api/admin/verify', methods=['POST'])
 def verify_admin():
     data, error = parse_json_body()
     if error:
         return error
-    return jsonify({'valid': data.get('code') == ADMIN_SECRET})
+    return jsonify({'valid': hmac.compare_digest(data.get('code', ''), ADMIN_SECRET)})
 
 @app.route('/api/tests', methods=['POST'])
 @require_admin
@@ -331,22 +362,24 @@ def test_stats(code):
     total_attempts = len(attempts)
     avg_score = round(sum(a['score'] for a in attempts) / total_attempts, 2) if total_attempts else 0
 
+    from collections import defaultdict
+    counters = defaultdict(lambda: {'c': 0, 'i': 0, 's': 0})
+    for a in attempts:
+        for ans in json.loads(a['answers']):
+            qid = ans['questionId']
+            if ans.get('skipped'): counters[qid]['s'] += 1
+            elif ans.get('correct'): counters[qid]['c'] += 1
+            else: counters[qid]['i'] += 1
+
     question_stats = []
     for q in questions:
-        c = i = s = 0
-        for a in attempts:
-            ans_list = json.loads(a['answers'])
-            ans = next((x for x in ans_list if x['questionId'] == q['id']), None)
-            if ans:
-                if ans.get('skipped'): s += 1
-                elif ans.get('correct'): c += 1
-                else: i += 1
+        cnt = counters[q['id']]
         question_stats.append({
             'id': q['id'], 'text': q['text'],
             'option1': q['option1'], 'option2': q['option2'],
             'option3': q['option3'], 'option4': q['option4'],
             'correctOption': q['correct_option'],
-            'correctCount': c, 'incorrectCount': i, 'skippedCount': s
+            'correctCount': cnt['c'], 'incorrectCount': cnt['i'], 'skippedCount': cnt['s']
         })
 
     return jsonify({'totalAttempts': total_attempts, 'avgScore': avg_score, 'questionStats': question_stats})
@@ -370,8 +403,8 @@ def test_report(code):
 @app.route('/api/tests/<code>', methods=['DELETE'])
 @require_admin
 def delete_test(code):
-    deleted = get_db().execute('DELETE FROM tests WHERE code = ?', (code,)).rowcount
-    get_db().commit()
+    with db_transaction() as db:
+        deleted = db.execute('DELETE FROM tests WHERE code = ?', (code,)).rowcount
     if deleted == 0:
         return jsonify({'error': 'Test not found'}), 404
     return jsonify({'success': True})
@@ -384,6 +417,10 @@ def payload_too_large(_):
 def handle_unexpected_error(error):
     logger.exception('Unhandled server error: %s', error)
     return jsonify({'error': 'Internal server error'}), 500
+
+@app.after_request
+def add_cors_headers(response):
+    return _apply_cors_headers(response)
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 

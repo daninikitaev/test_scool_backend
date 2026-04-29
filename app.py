@@ -1,7 +1,8 @@
 import os
 import json
 import sqlite3
-from datetime import datetime
+import logging
+from contextlib import contextmanager
 from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory, g
 from dotenv import load_dotenv
@@ -9,18 +10,36 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__, static_folder='static')
+logging.basicConfig(
+    level=os.getenv('LOG_LEVEL', 'INFO').upper(),
+    format='%(asctime)s %(levelname)s %(name)s %(message)s',
+)
+logger = logging.getLogger(__name__)
+
 ADMIN_SECRET = os.getenv('ADMIN_SECRET')
 if not ADMIN_SECRET:
     raise ValueError('ADMIN_SECRET not set')
-DATABASE = 'database.db'
+RAILWAY_VOLUME_PATH = os.getenv('RAILWAY_VOLUME_MOUNT_PATH')
+default_db_path = os.path.join(RAILWAY_VOLUME_PATH, 'database.db') if RAILWAY_VOLUME_PATH else os.path.join(os.getcwd(), 'database.db')
+DATABASE = os.getenv('DATABASE_PATH', default_db_path)
+MAX_QUESTIONS_PER_TEST = int(os.getenv('MAX_QUESTIONS_PER_TEST', '200'))
+MAX_REQUEST_SIZE_BYTES = int(os.getenv('MAX_REQUEST_SIZE_BYTES', str(2 * 1024 * 1024)))
+app.config['MAX_CONTENT_LENGTH'] = MAX_REQUEST_SIZE_BYTES
 
 # ─── Database ───────────────────────────────────────────────────────────────
+
+def _ensure_database_parent_exists():
+    parent = os.path.dirname(os.path.abspath(DATABASE))
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
 
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
+        _ensure_database_parent_exists()
         db = g._database = sqlite3.connect(DATABASE)
         db.row_factory = sqlite3.Row
+        db.execute('PRAGMA foreign_keys = ON')
     return db
 
 @app.teardown_appcontext
@@ -64,10 +83,25 @@ def init_db():
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (test_id) REFERENCES tests(id) ON DELETE CASCADE
             );
+            CREATE INDEX IF NOT EXISTS idx_questions_test_id ON questions(test_id);
+            CREATE INDEX IF NOT EXISTS idx_attempts_test_id ON attempts(test_id);
+            CREATE INDEX IF NOT EXISTS idx_attempts_created_at ON attempts(created_at);
         """)
         db.commit()
+        logger.info('Database initialized at %s', DATABASE)
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
+
+@contextmanager
+def db_transaction():
+    db = get_db()
+    try:
+        db.execute('BEGIN')
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
 def require_admin(f):
     @wraps(f)
@@ -90,6 +124,63 @@ def execute_db(query, args=()):
     db.commit()
     return cur.lastrowid
 
+def parse_json_body():
+    if not request.is_json:
+        return None, (jsonify({'error': 'Request body must be JSON'}), 400)
+    data = request.get_json(silent=True)
+    if data is None:
+        return None, (jsonify({'error': 'Invalid JSON body'}), 400)
+    return data, None
+
+def normalize_text(value, field_name, max_len=255, required=True):
+    if value is None:
+        value = ''
+    cleaned = str(value).strip()
+    if required and not cleaned:
+        return None, f'{field_name} is required'
+    if len(cleaned) > max_len:
+        return None, f'{field_name} is too long (max {max_len})'
+    return cleaned, None
+
+def validate_questions(questions):
+    if not isinstance(questions, list) or not questions:
+        return None, 'At least one question is required'
+    if len(questions) > MAX_QUESTIONS_PER_TEST:
+        return None, f'Too many questions (max {MAX_QUESTIONS_PER_TEST})'
+
+    validated = []
+    for idx, q in enumerate(questions, start=1):
+        if not isinstance(q, dict):
+            return None, f'Question {idx} must be an object'
+
+        text, err = normalize_text(q.get('text'), f'Question {idx} text', max_len=1000)
+        if err:
+            return None, err
+
+        opts = []
+        for opt_no in range(1, 5):
+            opt, opt_err = normalize_text(q.get(f'option{opt_no}'), f'Question {idx} option{opt_no}', max_len=500)
+            if opt_err:
+                return None, opt_err
+            opts.append(opt)
+
+        try:
+            correct = int(q.get('correctOption'))
+        except (TypeError, ValueError):
+            return None, f'Question {idx} correctOption must be an integer between 1 and 4'
+        if correct < 1 or correct > 4:
+            return None, f'Question {idx} correctOption must be 1-4'
+
+        validated.append({
+            'text': text,
+            'option1': opts[0],
+            'option2': opts[1],
+            'option3': opts[2],
+            'option4': opts[3],
+            'correctOption': correct,
+        })
+    return validated, None
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.route('/')
@@ -102,44 +193,54 @@ def static_files(path):
 
 @app.route('/api/health')
 def health():
-    return jsonify({'status': 'ok'})
+    return jsonify({'status': 'ok', 'service': 'telegram-test-miniapp', 'database': DATABASE})
 
 @app.route('/api/admin/verify', methods=['POST'])
 def verify_admin():
-    data = request.get_json() or {}
+    data, error = parse_json_body()
+    if error:
+        return error
     return jsonify({'valid': data.get('code') == ADMIN_SECRET})
 
 @app.route('/api/tests', methods=['POST'])
 @require_admin
 def create_test():
-    data = request.get_json() or {}
-    code = data.get('code', '').strip()
-    title = data.get('title', '').strip()
-    description = data.get('description', '').strip()
+    data, error = parse_json_body()
+    if error:
+        return error
+
+    code, code_err = normalize_text(data.get('code'), 'code', max_len=50)
+    if code_err:
+        return jsonify({'error': code_err}), 400
+    title, title_err = normalize_text(data.get('title'), 'title', max_len=200)
+    if title_err:
+        return jsonify({'error': title_err}), 400
+    description, desc_err = normalize_text(data.get('description', ''), 'description', max_len=2000, required=False)
+    if desc_err:
+        return jsonify({'error': desc_err}), 400
     questions = data.get('questions', [])
+    validated_questions, q_err = validate_questions(questions)
+    if q_err:
+        return jsonify({'error': q_err}), 400
 
-    if not code or not title or not questions:
-        return jsonify({'error': 'Code, title and at least one question required'}), 400
+    try:
+        with db_transaction() as db:
+            cursor = db.execute(
+                'INSERT INTO tests (code, title, description) VALUES (?, ?, ?)',
+                (code, title, description)
+            )
+            test_id = cursor.lastrowid
+            db.executemany(
+                'INSERT INTO questions (test_id, text, option1, option2, option3, option4, correct_option) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                [
+                    (test_id, q['text'], q['option1'], q['option2'], q['option3'], q['option4'], q['correctOption'])
+                    for q in validated_questions
+                ]
+            )
+    except sqlite3.IntegrityError:
+        return jsonify({'error': 'Test code already exists'}), 409
 
-    for q in questions:
-        if not q.get('text') or not q.get('option1') or not q.get('option2') or not q.get('option3') or not q.get('option4'):
-            return jsonify({'error': 'All question fields required'}), 400
-        co = q.get('correctOption', 0)
-        if co < 1 or co > 4:
-            return jsonify({'error': 'Correct option must be 1-4'}), 400
-
-    test_id = execute_db(
-        'INSERT INTO tests (code, title, description) VALUES (?, ?, ?)',
-        (code, title, description)
-    )
-
-    for q in questions:
-        execute_db(
-            'INSERT INTO questions (test_id, text, option1, option2, option3, option4, correct_option) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            (test_id, q['text'], q['option1'], q['option2'], q['option3'], q['option4'], q['correctOption'])
-        )
-
-    return jsonify({'success': True, 'testId': test_id})
+    return jsonify({'success': True, 'testId': test_id}), 201
 
 @app.route('/api/tests', methods=['GET'])
 @require_admin
@@ -164,10 +265,15 @@ def get_test(code):
 
 @app.route('/api/tests/<code>/attempts', methods=['POST'])
 def submit_attempt(code):
-    data = request.get_json() or {}
-    user_id = data.get('userId', 'anonymous')
-    username = data.get('username', 'Anonymous')
+    data, error = parse_json_body()
+    if error:
+        return error
+
+    user_id, _ = normalize_text(data.get('userId', 'anonymous'), 'userId', max_len=64, required=False)
+    username, _ = normalize_text(data.get('username', 'Anonymous'), 'username', max_len=100, required=False)
     answers = data.get('answers', {})
+    if not isinstance(answers, dict):
+        return jsonify({'error': 'answers must be an object keyed by question id'}), 400
 
     test = query_db('SELECT id FROM tests WHERE code = ?', (code,), one=True)
     if not test:
@@ -186,12 +292,13 @@ def submit_attempt(code):
         if user_ans is None:
             skipped += 1
             detailed.append({'questionId': q['id'], 'correct': False, 'skipped': True, 'correctAnswer': correct_opt})
-        elif int(user_ans) == correct_opt:
+        elif str(user_ans).isdigit() and int(user_ans) == correct_opt:
             correct += 1
             detailed.append({'questionId': q['id'], 'correct': True, 'skipped': False, 'correctAnswer': correct_opt})
         else:
             incorrect += 1
-            detailed.append({'questionId': q['id'], 'correct': False, 'skipped': False, 'userAnswer': int(user_ans), 'correctAnswer': correct_opt})
+            user_answer = int(user_ans) if str(user_ans).isdigit() else None
+            detailed.append({'questionId': q['id'], 'correct': False, 'skipped': False, 'userAnswer': user_answer, 'correctAnswer': correct_opt})
 
     total = len(questions)
     score = round((correct / total) * 100) if total > 0 else 0
@@ -263,12 +370,25 @@ def test_report(code):
 @app.route('/api/tests/<code>', methods=['DELETE'])
 @require_admin
 def delete_test(code):
-    execute_db('DELETE FROM tests WHERE code = ?', (code,))
+    deleted = get_db().execute('DELETE FROM tests WHERE code = ?', (code,)).rowcount
+    get_db().commit()
+    if deleted == 0:
+        return jsonify({'error': 'Test not found'}), 404
     return jsonify({'success': True})
+
+@app.errorhandler(413)
+def payload_too_large(_):
+    return jsonify({'error': 'Request too large'}), 413
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    logger.exception('Unhandled server error: %s', error)
+    return jsonify({'error': 'Internal server error'}), 500
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
+init_db()
+
 if __name__ == '__main__':
-    init_db()
     port = int(os.getenv('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
